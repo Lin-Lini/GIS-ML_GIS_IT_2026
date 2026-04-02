@@ -1,0 +1,15 @@
+affine
+catboost
+fiona
+geopandas
+hdbscan
+joblib
+matplotlib
+numpy
+pandas
+Pillow
+rasterio
+scikit-image
+scikit-learn
+scipy
+shapely

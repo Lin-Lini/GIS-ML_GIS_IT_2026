@@ -1,0 +1,12 @@
+pandas
+numpy
+geopandas
+shapely
+pyogrio
+fiona
+scikit-learn
+catboost
+hdbscan
+joblib
+matplotlib
+pyarrow
