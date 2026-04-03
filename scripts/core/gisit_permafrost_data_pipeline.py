@@ -1,5 +1,18 @@
-
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Основной GIS-пайплайн проекта GIS_IT_2026 / ArcticLens.
+
+Назначение скрипта:
+1. Найти и каталогизировать сцены Канопус.
+2. Построить рабочую AOI по фактическим footprint сцен.
+3. Подготовить годовые и сезонные композиты на единой сетке.
+4. Рассчитать спектральные, текстурные, рельефные и динамические признаки.
+5. Сформировать интерпретируемый baseline-индекс risk_score и тематические маски.
+6. Выполнить parcel-level агрегацию признаков по полигонам участков.
+7. Сохранить воспроизводимые артефакты в виде GeoTIFF, GeoJSON, GPKG и CSV.
+
+"""
 from __future__ import annotations
 
 import argparse
@@ -14,6 +27,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+# --- Внешние библиотеки для пространственной, растровой и табличной обработки данных. ---
 import geopandas as gpd
 import numpy as np
 import pandas as pd
@@ -32,23 +46,27 @@ from skimage.feature import graycomatrix, graycoprops
 from skimage.util import view_as_windows
 
 
+# Регулярное выражение для разбора имени папки сцены Канопус и извлечения даты, времени, уровня и типа продукта.
 SCENE_RE = re.compile(
     r'.*KANOPUS_(?P<date>\d{8})_(?P<time>\d{6})_\d+\.(?P<level>L\d)\.(?P<product>MS|PMS|PAN)\.SCN01',
     re.IGNORECASE,
 )
 
+# Границы сезонных интервалов, используемых при построении сезонных композитов.
 DEFAULT_SEASONS = {
     "early": ((5, 1), (6, 15)),
     "mid": ((6, 16), (7, 31)),
     "late": ((8, 1), (9, 30)),
 }
 
+# Пороговые значения для формирования ключевых тематических масок.
 CORE_MASK_THRESHOLDS = {
     "water_occurrence_persistence": 0.6,
     "risk_hotspot_quantile": 0.9,
     "texture_anomaly_quantile": 0.9,
 }
 
+# Веса компонент авторского baseline-индекса risk_score.
 RISK_WEIGHTS = {
     "water_growth": 0.25,
     "vegetation_loss": 0.20,
@@ -60,6 +78,7 @@ RISK_WEIGHTS = {
 
 @dataclass
 class SceneRecord:
+    """Структура с метаданными одной найденной сцены и путями к связанным файлам."""
     scene_pkg: str
     area: str
     work_folder: str
@@ -75,19 +94,23 @@ class SceneRecord:
 
 
 def log(msg: str) -> None:
+    """Печатает сервисное сообщение в stdout без буферизации."""
     print(msg, flush=True)
 
 
 def safe_mkdir(path: Path) -> Path:
+    """Создает каталог со всеми родительскими директориями и возвращает его путь."""
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def to_float32(arr: np.ndarray) -> np.ndarray:
+    """Приводит массив к типу float32 для единообразной работы с растровыми слоями."""
     return np.asarray(arr, dtype=np.float32)
 
 
 def nanpercentile(arr: np.ndarray, q: float) -> float:
+    """Считает процентиль только по конечным значениям массива."""
     vals = arr[np.isfinite(arr)]
     if vals.size == 0:
         return float("nan")
@@ -95,6 +118,7 @@ def nanpercentile(arr: np.ndarray, q: float) -> float:
 
 
 def robust_minmax(arr: np.ndarray, q_low: float = 5, q_high: float = 95) -> np.ndarray:
+    """Нормирует массив в диапазон [0, 1] по устойчивым квантилям, игнорируя выбросы."""
     vals = arr[np.isfinite(arr)]
     out = np.full(arr.shape, np.nan, dtype=np.float32)
     if vals.size == 0:
@@ -112,10 +136,12 @@ def robust_minmax(arr: np.ndarray, q_low: float = 5, q_high: float = 95) -> np.n
 
 
 def write_json(path: Path, obj: object) -> None:
+    """Сохраняет объект Python в JSON-файл с UTF-8 и читаемыми отступами."""
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def read_vector(path: str | Path) -> gpd.GeoDataFrame:
+    """Читает векторный слой из обычного пути или напрямую из ZIP-архива."""
     path = str(path)
     if path.lower().endswith(".zip"):
         return gpd.read_file(f"zip://{path}")
@@ -123,6 +149,7 @@ def read_vector(path: str | Path) -> gpd.GeoDataFrame:
 
 
 def save_vector(gdf: gpd.GeoDataFrame, path: Path) -> None:
+    """Сохраняет GeoDataFrame в подходящем формате по расширению файла."""
     if path.suffix.lower() == ".geojson":
         gdf.to_file(path, driver="GeoJSON")
     elif path.suffix.lower() in {".gpkg"}:
@@ -132,6 +159,7 @@ def save_vector(gdf: gpd.GeoDataFrame, path: Path) -> None:
 
 
 def fix_polygons(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Удаляет пустые геометрии, исправляет невалидные полигоны и оставляет только Polygon/MultiPolygon."""
     gdf = gdf.copy()
     gdf = gdf[~gdf.geometry.isna()]
     gdf = gdf[~gdf.geometry.is_empty]
@@ -142,6 +170,7 @@ def fix_polygons(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 
 def parse_area(work_folder: str) -> str:
+    """Определяет имя территории по названию рабочей папки."""
     s = work_folder.lower()
     if "амга" in s:
         return "Амга"
@@ -151,6 +180,7 @@ def parse_area(work_folder: str) -> str:
 
 
 def parse_scene_folder(scene_folder: str) -> Optional[Dict[str, str]]:
+    """Разбирает имя папки сцены и извлекает дату, время, год, уровень и тип продукта."""
     m = SCENE_RE.search(scene_folder)
     if not m:
         return None
@@ -167,12 +197,15 @@ def parse_scene_folder(scene_folder: str) -> Optional[Dict[str, str]]:
 
 
 def score_scene(product: str, level: str) -> int:
+    """Назначает сцене приоритет: MS и L2 считаются предпочтительными."""
     product_score = {"MS": 0, "PMS": 10, "PAN": 20}.get(product.upper(), 50)
     level_score = {"L2": 0, "L1": 1}.get(level.upper(), 5)
     return product_score + level_score
 
 
+# --- Этап 1. Поиск и каталогизация сцен. ---
 def discover_scene_dirs(data_root: Path) -> List[SceneRecord]:
+    """Рекурсивно ищет сцены в data_root и собирает метаданные по каждому валидному набору."""
     rows: List[SceneRecord] = []
     for tif_path in data_root.rglob("*.tif"):
         scene_dir = tif_path.parent
@@ -209,6 +242,7 @@ def discover_scene_dirs(data_root: Path) -> List[SceneRecord]:
 
 
 def scene_catalog_from_inventory(inventory_csv: Path) -> pd.DataFrame:
+    """Строит каталог сцен на основе inventory CSV, если он передан отдельно."""
     df = pd.read_csv(inventory_csv)
     df["path"] = df["FullName"].astype(str).str.replace("\\", "/", regex=False)
     rows = []
@@ -245,6 +279,7 @@ def scene_catalog_from_inventory(inventory_csv: Path) -> pd.DataFrame:
 
 
 def choose_best_ms_scenes(catalog: pd.DataFrame) -> pd.DataFrame:
+    """Оставляет только мультиспектральные сцены и выбирает лучшую сцену на acquisition."""
     if catalog.empty:
         return catalog
     df = catalog.copy()
@@ -257,6 +292,7 @@ def choose_best_ms_scenes(catalog: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_inventory_report(inventory_csv: Optional[Path], out_dir: Path) -> Optional[pd.DataFrame]:
+    """Создает сводный отчет по inventory CSV и сохраняет его в каталог результатов."""
     if inventory_csv is None or not inventory_csv.exists():
         return None
     catalog = scene_catalog_from_inventory(inventory_csv)
@@ -276,12 +312,14 @@ def build_inventory_report(inventory_csv: Optional[Path], out_dir: Path) -> Opti
 
 
 def catalog_to_df(rows: Sequence[SceneRecord]) -> pd.DataFrame:
+    """Преобразует список SceneRecord в табличный DataFrame."""
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame([asdict(r) for r in rows]).sort_values(["area", "date", "time", "score"]).reset_index(drop=True)
 
 
 def assign_season(ts: pd.Timestamp, seasons: Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]]) -> Optional[str]:
+    """Относит дату съемки к одному из заранее заданных сезонных интервалов."""
     if pd.isna(ts):
         return None
     for name, ((m1, d1), (m2, d2)) in seasons.items():
@@ -292,7 +330,9 @@ def assign_season(ts: pd.Timestamp, seasons: Dict[str, Tuple[Tuple[int, int], Tu
     return None
 
 
+# --- Этап 2. Построение AOI по footprint сцен и подготовка рабочей parcel-маски. ---
 def read_footprints(scene_catalog: pd.DataFrame) -> gpd.GeoDataFrame:
+    """Читает GBD-footprint для выбранных сцен и собирает их в один GeoDataFrame."""
     rows = []
     for row in scene_catalog.itertuples():
         gdf = read_vector(row.gbd_path)
@@ -308,12 +348,14 @@ def read_footprints(scene_catalog: pd.DataFrame) -> gpd.GeoDataFrame:
 
 
 def dissolve_aoi(footprints: gpd.GeoDataFrame) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """Строит AOI по территориям и общий union AOI на основе footprint сцен."""
     per_area = footprints.dissolve(by="area", as_index=False)
     union = gpd.GeoDataFrame([{"aoi_name": "all", "geometry": unary_union(list(per_area.geometry))}], crs=per_area.crs)
     return fix_polygons(per_area), fix_polygons(union)
 
 
 def clip_parcels_to_aoi(parcel_path: Optional[Path], aoi_union: gpd.GeoDataFrame) -> Optional[gpd.GeoDataFrame]:
+    """Обрезает слой участков по union AOI и при необходимости назначает parcel_id."""
     if parcel_path is None:
         return None
     parcels = read_vector(parcel_path)
@@ -328,6 +370,7 @@ def clip_parcels_to_aoi(parcel_path: Optional[Path], aoi_union: gpd.GeoDataFrame
 
 
 def bounds_union(bounds_list: Sequence[Tuple[float, float, float, float]]) -> Tuple[float, float, float, float]:
+    """Возвращает объединяющий bounding box для списка границ."""
     left = min(b[0] for b in bounds_list)
     bottom = min(b[1] for b in bounds_list)
     right = max(b[2] for b in bounds_list)
@@ -336,13 +379,16 @@ def bounds_union(bounds_list: Sequence[Tuple[float, float, float, float]]) -> Tu
 
 
 def area_bounds_in_crs(geoms: Iterable, src_crs, dst_crs) -> Tuple[float, float, float, float]:
+    """Переводит границы геометрий в целевую CRS и объединяет их в один extent."""
     bds = []
     for geom in geoms:
         bds.append(transform_bounds(src_crs, dst_crs, *geom.bounds, densify_pts=21))
     return bounds_union(bds)
 
 
+# --- Этап 3. Подготовка единой пространственной сетки и перепроекция сцен. ---
 def choose_reference_scene(scene_paths: Sequence[str]) -> Tuple[dict, float, float]:
+    """Выбирает опорную сцену с наилучшим пространственным разрешением."""
     best = None
     best_res = None
     for path in scene_paths:
@@ -359,6 +405,7 @@ def choose_reference_scene(scene_paths: Sequence[str]) -> Tuple[dict, float, flo
 
 
 def build_reference_grid(scene_paths: Sequence[str], clip_gdf: gpd.GeoDataFrame) -> Tuple[Affine, int, int, object]:
+    """Формирует единую расчетную сетку по AOI и разрешению опорной сцены."""
     ref_meta, resx, resy = choose_reference_scene(scene_paths)
     dst_crs = ref_meta["crs"]
     if clip_gdf.crs != dst_crs:
@@ -378,6 +425,7 @@ def read_reprojected_stack(
     dst_crs,
     band_map: Dict[str, int],
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Читает нужные каналы сцен, перепроецирует их на общую сетку и собирает стек."""
     band_order = ["blue", "green", "red", "nir"]
     idxs = [band_map[k] for k in band_order]
     stack = []
@@ -412,6 +460,7 @@ def read_reprojected_stack(
 
 
 def rasterize_mask(clip_gdf: gpd.GeoDataFrame, transform: Affine, width: int, height: int, dst_crs) -> np.ndarray:
+    """Растеризует AOI в булеву маску в координатах расчетной сетки."""
     if clip_gdf.crs != dst_crs:
         clip_gdf = clip_gdf.to_crs(dst_crs)
     geoms = [mapping(g) for g in clip_gdf.geometry]
@@ -420,6 +469,7 @@ def rasterize_mask(clip_gdf: gpd.GeoDataFrame, transform: Affine, width: int, he
 
 
 def median_composite(stack: np.ndarray, valid: np.ndarray, clip_mask: np.ndarray) -> np.ndarray:
+    """Строит медианный композит по стеку сцен с учетом валидности и маски AOI."""
     comp = np.nanmedian(stack, axis=0).astype(np.float32)
     comp[:, ~clip_mask] = np.nan
     missing = ~np.isfinite(comp).all(axis=0)
@@ -428,6 +478,7 @@ def median_composite(stack: np.ndarray, valid: np.ndarray, clip_mask: np.ndarray
 
 
 def write_multiband(path: Path, arr: np.ndarray, transform: Affine, crs, nodata: float = np.nan) -> None:
+    """Сохраняет многоканальный GeoTIFF со стандартными параметрами компрессии."""
     safe_mkdir(path.parent)
     meta = {
         "driver": "GTiff",
@@ -447,14 +498,18 @@ def write_multiband(path: Path, arr: np.ndarray, transform: Affine, crs, nodata:
 
 
 def write_singleband(path: Path, arr: np.ndarray, transform: Affine, crs, nodata: float = np.nan) -> None:
+    """Упрощенная обертка для сохранения одноканального растрового слоя."""
     write_multiband(path, arr[np.newaxis, ...], transform, crs, nodata=nodata)
 
 
 def eps(n: float = 1e-6) -> float:
+    """Возвращает малую константу для защиты от деления на ноль."""
     return n
 
 
+# --- Этап 4. Расчет спектральных, текстурных и рельефных признаков. ---
 def compute_indices(comp: np.ndarray, soil_index: str = "osavi") -> Dict[str, np.ndarray]:
+    """Рассчитывает базовые спектральные индексы и простые отношения каналов."""
     blue, green, red, nir = [comp[i].astype(np.float32) for i in range(4)]
     ndvi = (nir - red) / (nir + red + eps())
     ndwi = (green - nir) / (green + nir + eps())
@@ -481,6 +536,7 @@ def compute_indices(comp: np.ndarray, soil_index: str = "osavi") -> Dict[str, np
 
 
 def compute_pc1(comp: np.ndarray) -> np.ndarray:
+    """Считает первую главную компоненту по многоканальному композиту."""
     bands, h, w = comp.shape
     X = comp.reshape(bands, -1).T
     mask = np.isfinite(X).all(axis=1)
@@ -497,6 +553,7 @@ def compute_pc1(comp: np.ndarray) -> np.ndarray:
 
 
 def local_mean(arr: np.ndarray, size: int) -> np.ndarray:
+    """Считает локальное среднее в окне фиксированного размера."""
     valid = np.isfinite(arr).astype(np.float32)
     filled = np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
     sm = ndi.uniform_filter(filled, size=size, mode="nearest")
@@ -507,6 +564,7 @@ def local_mean(arr: np.ndarray, size: int) -> np.ndarray:
 
 
 def local_std_var(arr: np.ndarray, size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Считает локальное стандартное отклонение и дисперсию."""
     mean = local_mean(arr, size)
     sq = local_mean(arr ** 2, size)
     var = np.maximum(sq - mean ** 2, 0.0).astype(np.float32)
@@ -515,6 +573,7 @@ def local_std_var(arr: np.ndarray, size: int) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def local_range(arr: np.ndarray, size: int) -> np.ndarray:
+    """Считает локальный размах значений в окне."""
     maxv = ndi.maximum_filter(np.where(np.isfinite(arr), arr, -np.inf), size=size, mode="nearest")
     minv = ndi.minimum_filter(np.where(np.isfinite(arr), arr, np.inf), size=size, mode="nearest")
     out = (maxv - minv).astype(np.float32)
@@ -523,6 +582,7 @@ def local_range(arr: np.ndarray, size: int) -> np.ndarray:
 
 
 def laplacian(arr: np.ndarray) -> np.ndarray:
+    """Считает лапласиан по растру как меру локальной кривизны/резкости изменений."""
     filled = np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
     out = ndi.laplace(filled, mode="nearest").astype(np.float32)
     out[~np.isfinite(arr)] = np.nan
@@ -530,6 +590,7 @@ def laplacian(arr: np.ndarray) -> np.ndarray:
 
 
 def gradient_magnitude(arr: np.ndarray) -> np.ndarray:
+    """Считает модуль градиента по двум направлениям."""
     filled = np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
     gx = ndi.sobel(filled, axis=1, mode="nearest")
     gy = ndi.sobel(filled, axis=0, mode="nearest")
@@ -539,6 +600,7 @@ def gradient_magnitude(arr: np.ndarray) -> np.ndarray:
 
 
 def quantize_valid(arr: np.ndarray, levels: int = 16) -> np.ndarray:
+    """Квантует непрерывный растр в ограниченное число уровней для расчета GLCM."""
     vals = arr[np.isfinite(arr)]
     out = np.zeros(arr.shape, dtype=np.uint8)
     if vals.size == 0:
@@ -559,6 +621,7 @@ def glcm_metrics(
     downsample: int = 2,
     stride: int = 2,
 ) -> Dict[str, np.ndarray]:
+    """Рассчитывает GLCM-метрики текстуры в локальном окне и возвращает их как растры."""
     arr = arr.astype(np.float32)
     if downsample > 1:
         arr_small = arr[::downsample, ::downsample]
@@ -627,6 +690,7 @@ def glcm_metrics(
 
 
 def otsu_threshold(arr: np.ndarray) -> float:
+    """Оценивает порог по методу Оцу для одномерного распределения значений."""
     vals = arr[np.isfinite(arr)]
     if vals.size < 16:
         return 0.0
@@ -641,7 +705,9 @@ def otsu_threshold(arr: np.ndarray) -> float:
     return float(bin_edges[idx])
 
 
+# --- Этап 5. Формирование тематических масок и baseline-индекса risk_score. ---
 def water_mask_from_ndwi(ndwi: np.ndarray, force_threshold: Optional[float] = None) -> np.ndarray:
+    """Строит бинарную маску воды по NDWI и автоматическому или ручному порогу."""
     thr = force_threshold if force_threshold is not None else otsu_threshold(ndwi)
     out = np.zeros(ndwi.shape, dtype=np.uint8)
     out[np.isfinite(ndwi) & (ndwi > thr)] = 1
@@ -657,6 +723,7 @@ def terrain_from_dem(
     tri_window: int = 3,
     tpi_window: int = 11,
 ) -> Dict[str, np.ndarray]:
+    """Перепроецирует DEM на общую сетку и рассчитывает terrain-производные."""
     with rasterio.open(dem_path) as src:
         dem = np.full((height, width), np.nan, dtype=np.float32)
         src_arr = src.read(1).astype(np.float32)
@@ -706,6 +773,7 @@ def terrain_from_dem(
 
 
 def connected_components(mask: np.ndarray) -> Tuple[np.ndarray, Dict[int, int]]:
+    """Размечает связные компоненты в бинарной маске и возвращает их размеры."""
     labels, n = ndi.label(mask.astype(bool))
     if n == 0:
         return labels.astype(np.int32), {}
@@ -714,6 +782,7 @@ def connected_components(mask: np.ndarray) -> Tuple[np.ndarray, Dict[int, int]]:
 
 
 def zone_stats(values: np.ndarray) -> Dict[str, float]:
+    """Считает агрегированные статистики по зоне: mean, std, min, max, p90, p95."""
     vals = values[np.isfinite(values)]
     if vals.size == 0:
         return {
@@ -734,6 +803,7 @@ def zone_stats(values: np.ndarray) -> Dict[str, float]:
     }
 
 
+# --- Этап 6. Parcel-level агрегация признаков по участкам. ---
 def zonal_table(
     parcels: gpd.GeoDataFrame,
     raster_layers: Dict[str, np.ndarray],
@@ -743,6 +813,7 @@ def zonal_table(
     transform: Affine,
     crs,
 ) -> pd.DataFrame:
+    """Формирует parcel-level таблицу статистик по растру и тематическим маскам."""
     rows = []
     if parcels.crs != crs:
         parcels = parcels.to_crs(crs)
@@ -770,6 +841,7 @@ def zonal_table(
 
 
 def subtract_or_nan(curr: Optional[np.ndarray], prev: Optional[np.ndarray]) -> np.ndarray:
+    """Вычитает предыдущий слой из текущего, либо возвращает NaN-слой, если пары нет."""
     if curr is None or prev is None:
         shape = curr.shape if curr is not None else prev.shape
         return np.full(shape, np.nan, dtype=np.float32)
@@ -777,6 +849,7 @@ def subtract_or_nan(curr: Optional[np.ndarray], prev: Optional[np.ndarray]) -> n
 
 
 def normalize_component(arr: Optional[np.ndarray], invert: bool = False) -> np.ndarray:
+    """Нормирует компоненту риска и при необходимости инвертирует шкалу."""
     if arr is None:
         return np.array([], dtype=np.float32)
     out = robust_minmax(arr)
@@ -787,6 +860,7 @@ def normalize_component(arr: Optional[np.ndarray], invert: bool = False) -> np.n
 
 
 def combine_risk(components: Dict[str, np.ndarray]) -> np.ndarray:
+    """Объединяет нормированные компоненты в итоговый risk_score по весам."""
     ref = next(iter(components.values()))
     total = np.zeros(ref.shape, dtype=np.float32)
     weight_sum = np.zeros(ref.shape, dtype=np.float32)
@@ -804,6 +878,7 @@ def combine_risk(components: Dict[str, np.ndarray]) -> np.ndarray:
 
 
 def write_manifest(path: Path, items: Sequence[str]) -> None:
+    """Сохраняет список сформированных файлов в простой текстовый manifest."""
     path.write_text("\n".join(items) + "\n", encoding="utf-8")
 
 
@@ -813,6 +888,7 @@ def composite_for_group(
     out_path: Path,
     band_map: Dict[str, int],
 ) -> Tuple[np.ndarray, Affine, object]:
+    """Полный цикл построения композита для одного набора сцен."""
     scene_paths = group_df["tif_path"].tolist()
     transform, width, height, dst_crs = build_reference_grid(scene_paths, clip_gdf)
     clip_mask = rasterize_mask(clip_gdf, transform, width, height, dst_crs)
@@ -823,6 +899,7 @@ def composite_for_group(
 
 
 def save_layer_dict(layer_dict: Dict[str, np.ndarray], out_dir: Path, stem_prefix: str, transform: Affine, crs) -> List[str]:
+    """Сохраняет словарь растровых слоев на диск и возвращает список созданных файлов."""
     outputs = []
     for name, arr in layer_dict.items():
         path = out_dir / f"{stem_prefix}_{name}.tif"
@@ -831,7 +908,9 @@ def save_layer_dict(layer_dict: Dict[str, np.ndarray], out_dir: Path, stem_prefi
     return outputs
 
 
+# --- Главный конвейер обработки всего проекта. ---
 def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
+    """Основной конвейер обработки: от сцен и AOI до risk_score и parcel-level аналитики."""
     out_dir = Path(args.out_dir)
     safe_mkdir(out_dir)
     safe_mkdir(out_dir / "catalog")
@@ -845,25 +924,30 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
     safe_mkdir(out_dir / "analytics")
     safe_mkdir(out_dir / "parcels")
 
+    # Если передан inventory CSV, строим отдельный каталог и сводный отчет по поставке.
     inventory_catalog = build_inventory_report(Path(args.inventory_csv) if args.inventory_csv else None, out_dir / "catalog")
 
+    # Сканируем реальную файловую структуру и собираем каталог сцен.
     rows = discover_scene_dirs(Path(args.data_root))
     catalog = catalog_to_df(rows)
     if catalog.empty:
         raise ValueError("Не найдено ни одной валидной сцены под указанным data-root.")
     catalog.to_csv(out_dir / "catalog" / "scene_catalog_scan.csv", index=False, encoding="utf-8-sig")
 
+    # Оставляем только лучшие мультиспектральные сцены по каждой дате и времени съемки.
     selected = choose_best_ms_scenes(catalog)
     selected["date"] = pd.to_datetime(selected["date"])
     selected["season"] = selected["date"].apply(lambda x: assign_season(x, DEFAULT_SEASONS))
     selected.to_csv(out_dir / "catalog" / "scene_catalog_selected_ms.csv", index=False, encoding="utf-8-sig")
 
+    # По GBD-файлам строим footprint сцен и из них формируем рабочую AOI.
     footprints = read_footprints(selected)
     aoi_area, aoi_union = dissolve_aoi(footprints)
     save_vector(footprints, out_dir / "aoi" / "scene_footprints.gpkg")
     save_vector(aoi_area, out_dir / "aoi" / "area_aoi.gpkg")
     save_vector(aoi_union, out_dir / "aoi" / "aoi_union.geojson")
 
+    # Если передан слой участков, обрезаем его по union AOI и готовим к parcel-level аналитике.
     parcels = clip_parcels_to_aoi(Path(args.parcel_mask) if args.parcel_mask else None, aoi_union)
     if parcels is not None:
         save_vector(parcels, out_dir / "parcels" / "parcels_clipped.gpkg")
@@ -893,9 +977,11 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
             group = area_df[area_df["date"].dt.year == year].copy()
             if group.empty:
                 continue
+            # Для каждой территории и года строим медианный годовой композит.
             comp_path = out_dir / "composites" / f"{area}_{year}_annual_ms_composite.tif"
             comp, transform, crs = composite_for_group(group, area_aoi, comp_path, band_map)
             report["outputs"].append(str(comp_path))
+            # Сразу после композита рассчитываем базовые спектральные индексы.
             idx = compute_indices(comp, soil_index=args.soil_index)
             idx_dir = out_dir / "indices"
             report["outputs"].extend(save_layer_dict(idx, idx_dir, f"{area}_{year}_annual", transform, crs))
@@ -906,6 +992,7 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
             }
             if pc1 is not None:
                 tex_input["pc1"] = pc1
+            # Текстурные признаки считаются по NIR, Red и при необходимости по PC1.
             tex_layers: Dict[str, np.ndarray] = {}
             for src_name, src_arr in tex_input.items():
                 for win in [5, 7]:
@@ -918,12 +1005,14 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
             area_year_textures[(area, year)] = tex_layers
             report["outputs"].extend(save_layer_dict(tex_layers, out_dir / "textures", f"{area}_{year}", transform, crs))
 
+            # При наличии DEM рассчитываем terrain-производные.
             if args.dem:
                 terrain = terrain_from_dem(Path(args.dem), transform, comp.shape[2], comp.shape[1], crs)
                 report["outputs"].extend(save_layer_dict(terrain, out_dir / "terrain", f"{area}_{year}", transform, crs))
             else:
                 terrain = {}
 
+            # Водяная маска строится по NDWI и затем используется дальше в динамике и risk_score.
             water_mask = water_mask_from_ndwi(idx["ndwi"], force_threshold=args.water_threshold)
             area_year_cache[(area, year)] = {
                 "comp_blue": comp[0],
@@ -941,6 +1030,7 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
             write_singleband(out_dir / "masks" / f"{area}_{year}_water_mask.tif", water_mask.astype(np.float32), transform, crs)
             report["outputs"].append(str(out_dir / "masks" / f"{area}_{year}_water_mask.tif"))
 
+            # Дополнительно считаем сезонные композиты и индексы, если для сезона есть сцены.
             for season in ["early", "mid", "late"]:
                 sg = group[group["season"] == season]
                 if sg.empty:
@@ -985,12 +1075,14 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
             texture_driver = tex.get("nir_local_std_w7")
             if texture_driver is None:
                 texture_driver = next(iter(tex.values()))
+            # Выделяем зоны повышенной текстурной аномальности по верхнему квантилю.
             tex_q = nanpercentile(texture_driver, CORE_MASK_THRESHOLDS["texture_anomaly_quantile"] * 100)
             tex_mask = (texture_driver >= tex_q).astype(np.uint8)
             area_year_masks[curr_key]["high_texture_anomaly_mask"] = tex_mask.astype(np.float32)
             write_singleband(out_dir / "masks" / f"{area}_{year}_texture_anomaly_mask.tif", tex_mask.astype(np.float32), transform, crs)
             report["outputs"].append(str(out_dir / "masks" / f"{area}_{year}_texture_anomaly_mask.tif"))
 
+            # Считаем накопленную водную встречаемость и производную persistence_water_mask.
             occurrence = np.nanmean(np.stack(water_masks, axis=0), axis=0).astype(np.float32)
             persistence = (occurrence >= CORE_MASK_THRESHOLDS["water_occurrence_persistence"]).astype(np.uint8)
             area_year_masks[curr_key]["water_occurrence"] = occurrence
@@ -1002,6 +1094,7 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
                 str(out_dir / "masks" / f"{area}_{year}_persistence_water_mask.tif"),
             ])
 
+            # Change-mask формируется по сильным межгодовым изменениям NDVI/NDWI и приросту воды.
             if np.isfinite(d_ndvi).any() or np.isfinite(d_ndwi).any():
                 dn_thr = nanpercentile(np.abs(d_ndvi), 90)
                 dw_thr = nanpercentile(np.abs(d_ndwi), 90)
@@ -1030,6 +1123,7 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
             tmp_instability = np.full(tmp_sum.shape, np.nan, dtype=np.float32)
             tmp_instability[valid_cnt > 0] = (tmp_sum[valid_cnt > 0] / valid_cnt[valid_cnt > 0]).astype(np.float32)
 
+            # Составляем нормированные компоненты авторского индекса риска.
             comps = {
                 "water_growth": normalize_component(np.maximum(water_growth, 0.0)),
                 "vegetation_loss": normalize_component(-d_ndvi),
@@ -1037,6 +1131,7 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
                 "terrain_susceptibility": terrain_driver.astype(np.float32),
                 "temporal_instability": normalize_component(tmp_instability),
             }
+            # Итоговый risk_score объединяет все компоненты с заданными весами.
             risk = combine_risk(comps)
             rq = nanpercentile(risk, CORE_MASK_THRESHOLDS["risk_hotspot_quantile"] * 100)
             hotspot_mask = (risk >= rq).astype(np.uint8)
@@ -1049,6 +1144,7 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
                 str(out_dir / "masks" / f"{area}_{year}_hotspot_mask.tif"),
             ])
 
+            # Если есть полигоны участков, агрегируем по ним все ключевые признаки и маски.
             if parcels is not None:
                 raster_layers = {
                     "ndvi": curr["ndvi"],
@@ -1081,12 +1177,15 @@ def build_pipeline(args: argparse.Namespace) -> Dict[str, object]:
 
             prev_key = curr_key
 
+    # В конце сохраняем сводный JSON-отчет и текстовый manifest со списком всех артефактов.
     write_json(out_dir / "run_report.json", report)
     write_manifest(out_dir / "manifest.txt", report["outputs"])
     return report
 
 
+# --- Встроенный self-test для быстрой проверки воспроизводимости контура. ---
 def create_test_scene(scene_dir: Path, arr: np.ndarray, transform: Affine, crs="EPSG:4326") -> None:
+    """Создает синтетическую тестовую сцену и соответствующий footprint для self-test."""
     safe_mkdir(scene_dir)
     tif = scene_dir / f"{scene_dir.name}.tif"
     with rasterio.open(
@@ -1110,6 +1209,7 @@ def create_test_scene(scene_dir: Path, arr: np.ndarray, transform: Affine, crs="
 
 
 def run_self_test(base_script: Path) -> Dict[str, object]:
+    """Запускает минимальный автономный тест пайплайна на синтетических данных."""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         data_root = tmp / "data"
@@ -1200,7 +1300,9 @@ def run_self_test(base_script: Path) -> Dict[str, object]:
         return {"status": "ok", "out_dir": str(out_dir), "outputs": report["outputs"][:8]}
 
 
+# --- CLI: описание параметров запуска. ---
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Описывает аргументы командной строки для обычного запуска и self-test."""
     parser = argparse.ArgumentParser(prog="gisit_permafrost_data_pipeline.py")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1224,6 +1326,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Точка входа: разбирает аргументы и запускает нужный режим работы."""
     args = parse_args(argv)
     if args.command == "self-test":
         report = run_self_test(Path(__file__))
@@ -1238,3 +1341,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
